@@ -1,0 +1,107 @@
+name: Build & Push Docker image to ECR
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: ecr-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-west-2       
+  ECR_REPOSITORY: batm-staging-docker-imagee
+  START_VERSION: 1.0.0         
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials using OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_OIDC_ROLE }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Install jq (for version parsing)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq
+
+      - name: Compute next version from ECR (patch bump)
+        id: version
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Fetch tags from ECR (handles empty repos gracefully)
+          TAGS_JSON="$(aws ecr describe-images \
+            --repository-name "${ECR_REPOSITORY}" \
+            --query 'imageDetails[].imageTags' --output json 2>/dev/null || echo '[]')"
+
+          # Keep only strict X.Y.Z, sort numerically, take highest
+          HIGHEST="$(echo "${TAGS_JSON}" \
+            | jq -r '
+              [ .[]? | .[]? | select(test("^[0-9]+\\.[0-9]+\\.[0-9]+$")) ]
+              | sort_by( split(".") | map(tonumber) )
+              | last // empty
+            ')"
+
+          if [[ -z "${HIGHEST}" ]]; then
+            NEXT="${START_VERSION}"
+            echo "No numeric tags found, starting at ${NEXT}"
+          else
+            IFS='.' read -r MA MI PA <<< "${HIGHEST}"
+            NEXT="${MA}.${MI}.$((PA+1))"
+            echo "Highest existing tag: ${HIGHEST} -> next: ${NEXT}"
+          fi
+
+          # (Paranoia) ensure not already present to avoid IMMUTABLE collision
+          if aws ecr list-images --repository-name "${ECR_REPOSITORY}" \
+               --filter tagStatus=TAGGED --query 'imageIds[].imageTag' --output text \
+               | grep -qx "${NEXT}"; then
+            echo "Computed tag ${NEXT} already exists. Exiting to respect immutability." >&2
+            exit 1
+          fi
+
+          echo "next=${NEXT}" >> "$GITHUB_OUTPUT"
+
+      - name: Build Docker image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          TAG: ${{ steps.version.outputs.next }}
+        run: |
+          docker build -f Dockerfile \
+            -t "${ECR_REGISTRY}/${ECR_REPOSITORY}:${TAG}" \
+            .
+
+      - name: Push image to ECR
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          TAG: ${{ steps.version.outputs.next }}
+        run: |
+          docker push "${ECR_REGISTRY}/${ECR_REPOSITORY}:${TAG}"
+          echo "Pushed ${ECR_REGISTRY}/${ECR_REPOSITORY}:${TAG}"
+
+      - name: Summary
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          TAG: ${{ steps.version.outputs.next }}
+        run: |
+          echo "### Image pushed" >> $GITHUB_STEP_SUMMARY
+          echo "- \`${ECR_REGISTRY}/${ECR_REPOSITORY}:${TAG}\`" >> $GITHUB_STEP_SUMMARY
