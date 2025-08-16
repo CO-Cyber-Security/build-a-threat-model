@@ -14,8 +14,8 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  AWS_REGION: us-west-2       
-  ECR_REPOSITORY: batm-staging-docker-imagee
+  AWS_REGION: eu-west-2       
+  ECR_REPOSITORY: batm-staging-docker-image
   START_VERSION: 1.0.0         
 
 jobs:
