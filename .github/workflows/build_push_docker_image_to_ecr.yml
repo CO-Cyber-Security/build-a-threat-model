@@ -99,14 +99,37 @@ jobs:
       
       # --- DEPLOYMENT STEPS ---
 
-      - name: Download task definition
-        id: download-task-def
+      - name: Validate ECS names (quick sanity)
         run: |
-          # UPDATED: This now correctly uses the TASK_FAMILY to fetch the
-          # latest active task definition revision from AWS.
-          aws ecs describe-task-definition --task-definition ${{ env.TASK_FAMILY }} --query taskDefinition > ${{ env.ECS_TASK_DEFINITION }}
+          set -euo pipefail
+          echo "Cluster: ${ECS_CLUSTER}  Service: ${ECS_SERVICE}  Family: ${TASK_FAMILY}  Container: ${CONTAINER_NAME}"
+          aws ecs describe-clusters --clusters "$ECS_CLUSTER" --query 'clusters[].status'
+          aws ecs describe-services --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" --query 'services[].status'
 
-      - name: Fill in the new image ID in the Amazon ECS task definition
+      - name: Generate task definition from current (sanitize)
+        run: |
+          set -euo pipefail
+          # Get the latest ACTIVE revision for the family
+          aws ecs describe-task-definition \
+            --task-definition "${TASK_FAMILY}" \
+            --query taskDefinition > td.raw.json
+
+          # Remove read-only fields so it can be re-registered
+          jq 'del(
+              .taskDefinitionArn,
+              .revision,
+              .status,
+              .requiresAttributes,
+              .compatibilities,
+              .registeredAt,
+              .registeredBy
+            )' td.raw.json > "${ECS_TASK_DEFINITION}"
+
+          echo "Sanitized task-def saved to: ${ECS_TASK_DEFINITION}"
+          echo "Container names in TD:"
+          jq -r '.containerDefinitions[].name' "${ECS_TASK_DEFINITION}"
+
+      - name: Render task definition with new image
         id: task-def
         uses: aws-actions/amazon-ecs-render-task-definition@v1
         with:
@@ -122,16 +145,8 @@ jobs:
           cluster: ${{ env.ECS_CLUSTER }}
           wait-for-service-stability: true
 
-      - name: Summary
-        env:
-          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-          TAG: ${{ steps.version.outputs.next }}
-        run: |
-          echo "### ✅ Build and Deploy Succeeded" >> $GITHUB_STEP_SUMMARY
-          echo "- **Image pushed:** \`${ECR_REGISTRY}/${ECR_REPOSITORY}:${TAG}\`" >> $GITHUB_STEP_SUMMARY
-          echo "- **Deployed to:** `${{ env.ECS_CLUSTER }}` / `${{ env.ECS_SERVICE }}`" >> $GITHUB_STEP_SUMMARY
 
-
+          # --- SLACK NOTIFICATION STEP ---
       - name: Notify Slack (incoming webhook)
         if: ${{ success() }}
         env:
