@@ -78,17 +78,28 @@ jobs:
 
           echo "next=${NEXT}" >> "$GITHUB_OUTPUT"
 
-      # Buildx + cached build & push
+      # Enable BuildKit/Buildx
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build & Push (cached)
+      # Unique digest metadata (keeps cache but makes a new image each run)
+      - name: Compute build timestamp
+        id: buildmeta
+        run: echo "created=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
+      # Build & push with persistent cache and unique labels
+      - name: Build & Push (cached, unique digest)
         uses: docker/build-push-action@v5
         with:
           context: .
           file: Dockerfile
           push: true
           tags: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.version.outputs.next }}
+          labels: |
+            org.opencontainers.image.created=${{ steps.buildmeta.outputs.created }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.version.outputs.next }}
+            org.opencontainers.image.source=${{ github.repository }}
           cache-from: type=gha,scope=ecr-main
           cache-to: type=gha,mode=max,scope=ecr-main
           provenance: false
