@@ -14,9 +14,9 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  AWS_REGION: eu-west-2       
+  AWS_REGION: eu-west-2
   ECR_REPOSITORY: batm-staging-docker-image
-  START_VERSION: 1.0.0         
+  START_VERSION: 1.0.0
 
 jobs:
   build-and-push:
@@ -49,12 +49,10 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Fetch tags from ECR (handles empty repos gracefully)
           TAGS_JSON="$(aws ecr describe-images \
             --repository-name "${ECR_REPOSITORY}" \
             --query 'imageDetails[].imageTags' --output json 2>/dev/null || echo '[]')"
 
-          # Keep only strict X.Y.Z, sort numerically, take highest
           HIGHEST="$(echo "${TAGS_JSON}" \
             | jq -r '
               [ .[]? | .[]? | select(test("^[0-9]+\\.[0-9]+\\.[0-9]+$")) ]
@@ -71,7 +69,6 @@ jobs:
             echo "Highest existing tag: ${HIGHEST} -> next: ${NEXT}"
           fi
 
-          # (Paranoia) ensure not already present to avoid IMMUTABLE collision
           if aws ecr list-images --repository-name "${ECR_REPOSITORY}" \
                --filter tagStatus=TAGGED --query 'imageIds[].imageTag' --output text \
                | grep -qx "${NEXT}"; then
@@ -105,3 +102,38 @@ jobs:
         run: |
           echo "### Image pushed" >> $GITHUB_STEP_SUMMARY
           echo "- \`${ECR_REGISTRY}/${ECR_REPOSITORY}:${TAG}\`" >> $GITHUB_STEP_SUMMARY
+
+      - name: Notify Slack (incoming webhook)
+        if: ${{ success() }}
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: ${{ env.ECR_REPOSITORY }}
+          TAG: ${{ steps.version.outputs.next }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update >/dev/null && sudo apt-get install -y jq >/dev/null
+          IMAGE="${ECR_REGISTRY}/${ECR_REPOSITORY}:${TAG}"
+          SHORT_SHA="${GITHUB_SHA::7}"
+          RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+
+          payload=$(jq -n \
+            --arg header ":whale: *Docker image pushed to ECR*" \
+            --arg image "$IMAGE" \
+            --arg tag "$TAG" \
+            --arg repo "$GITHUB_REPOSITORY" \
+            --arg sha "$SHORT_SHA" \
+            --arg run "$RUN_URL" \
+            '{text:$header, blocks:[
+              {type:"section", text:{type:"mrkdwn", text:$header}},
+              {type:"section", fields:[
+                {type:"mrkdwn", text:"*Image:*\n\($image)"},
+                {type:"mrkdwn", text:"*Tag:*\n\($tag)"},
+                {type:"mrkdwn", text:"*Repo:*\n\($repo)"},
+                {type:"mrkdwn", text:"*Commit:*\n\($sha)"},
+                {type:"mrkdwn", text:"*Workflow run:*\n\($run)"}
+              ]}
+            ]}')
+
+          curl -X POST -H 'Content-type: application/json' \
+               --data "$payload" "$SLACK_WEBHOOK_URL"
