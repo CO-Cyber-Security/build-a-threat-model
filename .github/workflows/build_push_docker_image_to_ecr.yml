@@ -112,75 +112,63 @@ jobs:
           echo "### Image pushed" >> $GITHUB_STEP_SUMMARY
           echo "- \`${ECR_REGISTRY}/${ECR_REPOSITORY}:${TAG}\`" >> $GITHUB_STEP_SUMMARY
       
-# ---------- DEPLOY TO ECS ----------
+ # ========== DEPLOY TO ECS ==========
       - name: Set ECS deploy vars
         env:
-            CLUSTER_NAME: ${{ vars.CLUSTER_NAME }}   # e.g. batm-sandbox-ecs-cluster (set in repo Variables)
-            SERVICE_NAME: batm                       # ECS service name (from Terraform)
-            TASK_FAMILY: batm                        # Task definition family
-            CONTAINER_NAME: batm                     # Container name inside the task def
-            ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-            ECR_REPOSITORY: ${{ env.ECR_REPOSITORY }}
-            TAG: ${{ steps.version.outputs.next }}
+          CLUSTER_NAME: ${{ vars.CLUSTER_NAME }}
+          SERVICE_NAME: ${{ vars.SERVICE_NAME }}
+          TASK_DEFINITION_NAME: ${{ vars.TASK_DEFINITION_NAME }}
+          CONTAINER_NAME: ${{ vars.CONTAINER_NAME }}
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: ${{ env.ECR_REPOSITORY }}
+          TAG: ${{ steps.version.outputs.next }}
         run: |
-            echo "CLUSTER_NAME=${CLUSTER_NAME}" >> $GITHUB_ENV
-            echo "SERVICE_NAME=${SERVICE_NAME}" >> $GITHUB_ENV
-            echo "TASK_FAMILY=${TASK_FAMILY}" >> $GITHUB_ENV
-            echo "CONTAINER_NAME=${CONTAINER_NAME}" >> $GITHUB_ENV
-            echo "IMAGE=${ECR_REGISTRY}/${ECR_REPOSITORY}:${TAG}" >> $GITHUB_ENV
+          echo "CLUSTER_NAME=${CLUSTER_NAME}" >> $GITHUB_ENV
+          echo "SERVICE_NAME=${SERVICE_NAME}" >> $GITHUB_ENV
+          echo "TASK_DEFINITION_NAME=${TASK_DEFINITION_NAME}" >> $GITHUB_ENV
+          echo "CONTAINER_NAME=${CONTAINER_NAME}" >> $GITHUB_ENV
+          echo "IMAGE=${ECR_REGISTRY}/${ECR_REPOSITORY}:${TAG}" >> $GITHUB_ENV
 
-      - name: Render next task definition (inject new image)
-        id: render-td
+      - name: Generate task definition from current
         run: |
-            set -euo pipefail
-            aws ecs describe-task-definition \
-            --task-definition "$TASK_FAMILY" \
-            --query 'taskDefinition' > td.json
+          aws ecs describe-task-definition \
+            --task-definition "$TASK_DEFINITION_NAME" \
+            --query taskDefinition > task-definition.json
+          # strip read-only fields
+          jq 'del(
+            .taskDefinitionArn,
+            .requiresAttributes,
+            .compatibilities,
+            .revision,
+            .status,
+            .registeredAt,
+            .registeredBy
+          )' task-definition.json > task-definition.json.clean
 
-            # Strip read-only fields and set the new image for the chosen container
-            jq --arg img "$IMAGE" --arg name "$CONTAINER_NAME" '
-            del(.taskDefinitionArn,.revision,.status,.requiresAttributes,.compatibilities,.registeredAt,.registeredBy)
-            | .containerDefinitions |= map(if .name==$name then (.image=$img) else . end)
-            ' td.json > td.new.json
+      - name: Render task definition with new image
+        id: task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition.json.clean
+          container-name: ${{ env.CONTAINER_NAME }}
+          image: ${{ env.IMAGE }}
 
-            echo "Rendered task def with image:"
-            jq -r '.family, (.containerDefinitions[] | select(.name=="'"$CONTAINER_NAME"'").image)' td.new.json
-
-      - name: Register new task definition revision
-        id: register-td
-        run: |
-            set -euo pipefail
-            NEW_TD_ARN=$(aws ecs register-task-definition \
-            --cli-input-json file://td.new.json \
-            --query 'taskDefinition.taskDefinitionArn' \
-            --output text)
-            echo "new_td_arn=${NEW_TD_ARN}" >> "$GITHUB_OUTPUT"
-            echo "Registered: ${NEW_TD_ARN}"
-
-      - name: Update ECS service to new task def
-        run: |
-            set -euo pipefail
-            aws ecs update-service \
-            --cluster  "$CLUSTER_NAME" \
-            --service  "$SERVICE_NAME" \
-            --task-definition "${{ steps.register-td.outputs.new_td_arn }}" \
-            --force-new-deployment
-
-      - name: Wait for service stable
-        run: |
-            set -euo pipefail
-            aws ecs wait services-stable \
-            --cluster "$CLUSTER_NAME" \
-            --services "$SERVICE_NAME"
+      - name: Deploy Amazon ECS task definition
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v1
+        with:
+          task-definition: ${{ steps.task-def.outputs.task-definition }}
+          service: ${{ env.SERVICE_NAME }}
+          cluster: ${{ env.CLUSTER_NAME }}
+          wait-for-service-stability: true
 
       - name: Deploy summary
         env:
-            IMAGE: ${{ env.IMAGE }}
-            TD_ARN: ${{ steps.register-td.outputs.new_td_arn }}
+          IMAGE: ${{ env.IMAGE }}
         run: |
-            echo "### ECS Deploy" >> $GITHUB_STEP_SUMMARY
-            echo "- Image: \`${IMAGE}\`" >> $GITHUB_STEP_SUMMARY
-            echo "- Task def: \`${TD_ARN}\`" >> $GITHUB_STEP_SUMMARY
+          echo "### ECS Deploy" >> $GITHUB_STEP_SUMMARY
+          echo "- Cluster: \`${{ env.CLUSTER_NAME }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Service: \`${{ env.SERVICE_NAME }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Image: \`${IMAGE}\`" >> $GITHUB_STEP_SUMMARY
 
 
       - name: Notify Slack (incoming webhook)
