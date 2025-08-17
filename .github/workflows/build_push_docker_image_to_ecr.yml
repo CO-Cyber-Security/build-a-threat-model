@@ -145,3 +145,69 @@ jobs:
             ]}')
           curl -X POST -H 'Content-type: application/json' \
                --data "$payload" "$SLACK_WEBHOOK_URL"
+
+      # ---------- DEPLOY TO ECS ----------
+      - name: Set ECS deploy vars
+        env:
+          CLUSTER_NAME: batm              # <-- your ECS cluster name
+          SERVICE_NAME: batm              # <-- your ECS service name
+          TASK_FAMILY: batm               # <-- your task definition family
+          CONTAINER_NAME: batm            # <-- container name inside task def
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: ${{ env.ECR_REPOSITORY }}
+          TAG: ${{ steps.version.outputs.next }}
+        run: |
+          echo "CLUSTER_NAME=${CLUSTER_NAME}" >> $GITHUB_ENV
+          echo "SERVICE_NAME=${SERVICE_NAME}" >> $GITHUB_ENV
+          echo "TASK_FAMILY=${TASK_FAMILY}" >> $GITHUB_ENV
+          echo "CONTAINER_NAME=${CONTAINER_NAME}" >> $GITHUB_ENV
+          echo "IMAGE=${ECR_REGISTRY}/${ECR_REPOSITORY}:${TAG}" >> $GITHUB_ENV
+
+      - name: Render next task definition (inject new image)
+        id: render-td
+        run: |
+          set -euo pipefail
+          aws ecs describe-task-definition \
+            --task-definition "$TASK_FAMILY" \
+            --query 'taskDefinition' > td.json
+
+          # strip read-only fields + set new image
+          jq 'del(.taskDefinitionArn,.revision,.status,.requiresAttributes,.compatibilities,.registeredAt,.registeredBy)
+              | .containerDefinitions |= map(if .name=="'"$CONTAINER_NAME"'" then .image="'"$IMAGE"'" else . end)
+          ' td.json > td.new.json
+
+          echo "Rendered task def:"
+          jq '.family,.containerDefinitions[].image' td.new.json
+
+      - name: Register new task definition revision
+        id: register-td
+        run: |
+          NEW_TD_ARN=$(aws ecs register-task-definition \
+            --cli-input-json file://td.new.json \
+            --query 'taskDefinition.taskDefinitionArn' \
+            --output text)
+          echo "new_td_arn=${NEW_TD_ARN}" >> "$GITHUB_OUTPUT"
+          echo "Registered: ${NEW_TD_ARN}"
+
+      - name: Update ECS service to new task def
+        run: |
+          aws ecs update-service \
+            --cluster  "$CLUSTER_NAME" \
+            --service  "$SERVICE_NAME" \
+            --task-definition "${{ steps.register-td.outputs.new_td_arn }}" \
+            --force-new-deployment
+
+      - name: Wait for service stable
+        run: |
+          aws ecs wait services-stable \
+            --cluster "$CLUSTER_NAME" \
+            --services "$SERVICE_NAME"
+
+      - name: Deploy summary
+        env:
+          IMAGE: ${{ env.IMAGE }}
+          TD_ARN: ${{ steps.register-td.outputs.new_td_arn }}
+        run: |
+          echo "### ECS Deploy" >> $GITHUB_STEP_SUMMARY
+          echo "- Image: \`${IMAGE}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Task def: \`${TD_ARN}\`" >> $GITHUB_STEP_SUMMARY
