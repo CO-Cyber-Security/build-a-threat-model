@@ -1,9 +1,9 @@
-name: Build, Push, and Deploy to ECS
+name: Build, Push & Deploy to ECS
 
 on:
   push:
-    branches:
-      - main
+    branches: [main]
+  workflow_dispatch:
 
 permissions:
   id-token: write
@@ -14,40 +14,38 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  # These should be set as Repository Variables (Settings -> Secrets and variables -> Actions -> Variables)
-  AWS_REGION:        ${{ vars.AWS_REGION }}        # e.g. eu-west-2
-  ECR_REPOSITORY:    ${{ vars.ECR_REPOSITORY }}    # e.g. batm-staging-docker-image
-  START_VERSION:     ${{ vars.START_VERSION }}     # e.g. 1.0.0
-  ECS_SERVICE:       ${{ vars.SERVICE_NAME }}      # e.g. batm
-  ECS_CLUSTER:       ${{ vars.CLUSTER_NAME }}      # e.g. batm-dev-ecs-cluster
-  TASK_FAMILY:       ${{ vars.TASK_FAMILY }}       # e.g. batm
-  CONTAINER_NAME:    ${{ vars.CONTAINER_NAME }}    # e.g. batm
-  ECS_TASK_DEFINITION: task-definition.json        # local filename used during deploy
+  AWS_REGION:       ${{ vars.AWS_REGION }}
+  ECR_REPOSITORY:   ${{ vars.ECR_REPOSITORY }}
+  START_VERSION:    ${{ vars.START_VERSION }}
+  CLUSTER_NAME:     ${{ vars.CLUSTER_NAME }}
+  SERVICE_NAME:     ${{ vars.SERVICE_NAME }}
+  TASK_FAMILY:      ${{ vars.TASK_FAMILY }}
+  CONTAINER_NAME:   ${{ vars.CONTAINER_NAME }}
+  TD_FILE:          task-definition.json
 
 jobs:
-  build-push-and-deploy:
+  build-push-deploy:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Configure AWS credentials (OIDC)
+      - name: Configure AWS (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_OIDC_ROLE }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Login to Amazon ECR
+      - name: Login to ECR
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Install jq
+      - name: Install prerequisites
         run: |
-          sudo apt-get update
+          sudo apt-get update -y
           sudo apt-get install -y jq
 
-      # ---------- VERSIONING (patch bump X.Y.Z -> X.Y.(Z+1)) ----------
+      # -------- versioning (patch bump) --------
       - name: Compute next version from ECR
         id: version
         env:
@@ -60,138 +58,91 @@ jobs:
             --query 'imageDetails[].imageTags' --output json 2>/dev/null || echo '[]')"
 
           HIGHEST="$(echo "${TAGS_JSON}" \
-            | jq -r '
-              [ .[]? | .[]? | select(test("^[0-9]+\\.[0-9]+\\.[0-9]+$")) ]
-              | sort_by( split(".") | map(tonumber) )
-              | last // empty
-            ')"
+            | jq -r '[ .[]? | .[]? | select(test("^[0-9]+\\.[0-9]+\\.[0-9]+$")) ]
+                      | sort_by( split(".") | map(tonumber) )
+                      | last // empty')"
 
           if [[ -z "${HIGHEST}" ]]; then
             NEXT="${START_VERSION}"
-            echo "No numeric tags found, starting at ${NEXT}"
           else
             IFS='.' read -r MA MI PA <<< "${HIGHEST}"
             NEXT="${MA}.${MI}.$((PA+1))"
-            echo "Highest existing tag: ${HIGHEST} -> next: ${NEXT}"
           fi
 
-          # safety for immutable repos
+          # immutability safety
           if aws ecr list-images --repository-name "${ECR_REPOSITORY}" \
                --filter tagStatus=TAGGED --query 'imageIds[].imageTag' --output text \
                | grep -qx "${NEXT}"; then
-            echo "Computed tag ${NEXT} already exists. Exiting to respect immutability." >&2
+            echo "Computed tag ${NEXT} already exists" >&2
             exit 1
           fi
 
           echo "next=${NEXT}" >> "$GITHUB_OUTPUT"
+          echo "New tag: ${NEXT}"
 
-      # ---------- BUILD & PUSH (ARM64 with cache) ----------
-      - name: Set up QEMU (for cross-arch build)
-        uses: docker/setup-qemu-action@v3
-        with:
-          platforms: arm64
-
+      # -------- build & push (cached) --------
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Compute build timestamp
-        id: buildmeta
-        run: echo "created=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
-
-      - name: Build & Push Docker image to ECR
+      - name: Build & Push image
         id: build-image
         uses: docker/build-push-action@v5
         with:
           context: .
           file: Dockerfile
           push: true
-          platforms: linux/arm64
           tags: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.version.outputs.next }}
-          labels: |
-            org.opencontainers.image.created=${{ steps.buildmeta.outputs.created }}
-            org.opencontainers.image.revision=${{ github.sha }}
-            org.opencontainers.image.version=${{ steps.version.outputs.next }}
-            org.opencontainers.image.source=${{ github.repository }}
           cache-from: type=gha,scope=ecr-main
           cache-to: type=gha,mode=max,scope=ecr-main
           provenance: false
+          labels: |
+            org.opencontainers.image.version=${{ steps.version.outputs.next }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=${{ github.repository }}
 
-      # ---------- DEPLOY TO ECS ----------
-      - name: Download current task definition (latest revision of family)
+      # -------- deploy to ECS --------
+      - name: Download current task definition
         run: |
+          # get the latest ACTIVE revision for the family
           aws ecs describe-task-definition \
-            --task-definition "${{ env.TASK_FAMILY }}" \
-            --query taskDefinition > "${{ env.ECS_TASK_DEFINITION }}"
+            --task-definition "${TASK_FAMILY}" \
+            --query taskDefinition > td.json
 
-      - name: Sanitize task definition (remove read-only fields)
-        run: |
-          jq 'del(
-            .taskDefinitionArn,
-            .revision,
-            .status,
-            .requiresAttributes,
-            .compatibilities,
-            .registeredAt,
-            .registeredBy
-          )' "${{ env.ECS_TASK_DEFINITION }}" > td.clean.json
-          mv td.clean.json "${{ env.ECS_TASK_DEFINITION }}"
+          # strip read-only fields so we can re-register
+          jq 'del(.taskDefinitionArn,.revision,.status,.requiresAttributes,
+                  .compatibilities,.registeredAt,.registeredBy)' td.json > "${TD_FILE}"
 
-      - name: Fill in the new image ID in the Amazon ECS task definition
+      - name: Render task definition with new image
         id: task-def
         uses: aws-actions/amazon-ecs-render-task-definition@v1
         with:
-          task-definition: ${{ env.ECS_TASK_DEFINITION }}
+          task-definition: ${{ env.TD_FILE }}
           container-name: ${{ env.CONTAINER_NAME }}
           image: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.version.outputs.next }}
 
-      - name: Deploy Amazon ECS task definition
+      - name: Deploy new task definition to ECS service
         uses: aws-actions/amazon-ecs-deploy-task-definition@v1
         with:
           task-definition: ${{ steps.task-def.outputs.task-definition }}
-          service: ${{ env.ECS_SERVICE }}
-          cluster: ${{ env.ECS_CLUSTER }}
+          service: ${{ env.SERVICE_NAME }}
+          cluster: ${{ env.CLUSTER_NAME }}
           wait-for-service-stability: true
 
-      # ---------- SUMMARY & SLACK ----------
+      # -------- summary & (optional) Slack --------
       - name: Summary
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
           TAG: ${{ steps.version.outputs.next }}
         run: |
-          echo "### ✅ Build and Deploy Succeeded" >> $GITHUB_STEP_SUMMARY
-          echo "- **Image pushed:** \`${ECR_REGISTRY}/${ECR_REPOSITORY}:${TAG}\`" >> $GITHUB_STEP_SUMMARY
-          echo "- **Cluster/Service:** \`${{ env.ECS_CLUSTER }}\` / \`${{ env.ECS_SERVICE }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "- **Commit:** \`${GITHUB_SHA}\`" >> $GITHUB_STEP_SUMMARY
+          echo "### ✅ Build & Deploy Succeeded" >> $GITHUB_STEP_SUMMARY
+          echo "- Image: \`${ECR_REGISTRY}/${ECR_REPOSITORY}:${TAG}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Cluster/Service: \`${CLUSTER_NAME}\` / \`${SERVICE_NAME}\`" >> $GITHUB_STEP_SUMMARY
 
-      - name: Notify Slack (incoming webhook)
+      - name: Notify Slack (optional)
         if: ${{ success() && secrets.SLACK_WEBHOOK_URL != '' }}
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-          ECR_REPOSITORY: ${{ env.ECR_REPOSITORY }}
-          TAG: ${{ steps.version.outputs.next }}
+          IMAGE: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.version.outputs.next }}
         run: |
-          set -euo pipefail
-          sudo apt-get update >/dev/null && sudo apt-get install -y jq >/dev/null
-          IMAGE="${ECR_REGISTRY}/${ECR_REPOSITORY}:${TAG}"
-          SHORT_SHA="${GITHUB_SHA::7}"
-          RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
-
-          payload=$(jq -n \
-            --arg header ":whale: *Docker image pushed & ECS deployed*" \
-            --arg image "$IMAGE" \
-            --arg tag "$TAG" \
-            --arg repo "$GITHUB_REPOSITORY" \
-            --arg sha "$SHORT_SHA" \
-            --arg run "$RUN_URL" \
-            '{text:$header, blocks:[
-              {type:"section", text:{type:"mrkdwn", text:$header}},
-              {type:"section", fields:[
-                {type:"mrkdwn", text:"*Image:*\n\($image)"},
-                {type:"mrkdwn", text:"*Tag:*\n\($tag)"},
-                {type:"mrkdwn", text:"*Repo:*\n\($repo)"},
-                {type:"mrkdwn", text:"*Commit:*\n\($sha)"},
-                {type:"mrkdwn", text:"*Workflow:*\n\($run)"}
-              ]}
-            ]}')
+          payload=$(jq -n --arg t ":whale: Deployed *$IMAGE* to *${CLUSTER_NAME}/${SERVICE_NAME}*" '{text:$t}')
           curl -X POST -H 'Content-type: application/json' --data "$payload" "$SLACK_WEBHOOK_URL"
