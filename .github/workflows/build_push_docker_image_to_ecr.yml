@@ -78,22 +78,20 @@ jobs:
 
           echo "next=${NEXT}" >> "$GITHUB_OUTPUT"
 
-      - name: Build Docker image
-        env:
-          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-          TAG: ${{ steps.version.outputs.next }}
-        run: |
-          docker build -f Dockerfile \
-            -t "${ECR_REGISTRY}/${ECR_REPOSITORY}:${TAG}" \
-            .
+      # Buildx + cached build & push
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
-      - name: Push image to ECR
-        env:
-          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-          TAG: ${{ steps.version.outputs.next }}
-        run: |
-          docker push "${ECR_REGISTRY}/${ECR_REPOSITORY}:${TAG}"
-          echo "Pushed ${ECR_REGISTRY}/${ECR_REPOSITORY}:${TAG}"
+      - name: Build & Push (cached)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile
+          push: true
+          tags: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.version.outputs.next }}
+          cache-from: type=gha,scope=ecr-main
+          cache-to: type=gha,mode=max,scope=ecr-main
+          provenance: false
 
       - name: Summary
         env:
@@ -134,6 +132,5 @@ jobs:
                 {type:"mrkdwn", text:"*Workflow run:*\n\($run)"}
               ]}
             ]}')
-
           curl -X POST -H 'Content-type: application/json' \
                --data "$payload" "$SLACK_WEBHOOK_URL"
