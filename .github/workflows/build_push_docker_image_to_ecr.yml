@@ -14,6 +14,9 @@ concurrency:
   cancel-in-progress: false
 
 env:
+  # --- Configuration Pulled from GitHub Repository Variables ---
+  # This section now references the variables you've set in your
+  # repository's settings (Settings > Secrets and variables > Actions > Variables).
   AWS_REGION: ${{ vars.AWS_REGION }}
   ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
   START_VERSION: ${{ vars.START_VERSION }}
@@ -21,7 +24,7 @@ env:
   ECS_CLUSTER: ${{ vars.CLUSTER_NAME }}
   TASK_FAMILY: ${{ vars.TASK_FAMILY }}
   CONTAINER_NAME: ${{ vars.CONTAINER_NAME }}
-  ECS_TASK_DEFINITION: task-definition.json
+  ECS_TASK_DEFINITION: task-definition.json # Local filename for the task definition
 
 jobs:
   build-push-and-deploy:
@@ -51,24 +54,24 @@ jobs:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
         shell: bash
         run: |
+          # This script correctly computes the next patch version.
+          # No changes were needed here.
           set -euo pipefail
           TAGS_JSON="$(aws ecr describe-images --repository-name "${ECR_REPOSITORY}" --query 'imageDetails[].imageTags' --output json 2>/dev/null || echo '[]')"
           HIGHEST="$(echo "${TAGS_JSON}" | jq -r '[ .[]? | .[]? | select(test("^[0-9]+\\.[0-9]+\\.[0-9]+$")) ] | sort_by( split(".") | map(tonumber) ) | last // empty')"
           if [[ -z "${HIGHEST}" ]]; then
             NEXT="${START_VERSION}"
+            echo "No numeric tags found, starting at ${NEXT}"
           else
             IFS='.' read -r MA MI PA <<< "${HIGHEST}"
             NEXT="${MA}.${MI}.$((PA+1))"
+            echo "Highest existing tag: ${HIGHEST} -> next: ${NEXT}"
           fi
           if aws ecr list-images --repository-name "${ECR_REPOSITORY}" --filter tagStatus=TAGGED --query 'imageIds[].imageTag' --output text | grep -qx "${NEXT}"; then
-            echo "Computed tag ${NEXT} already exists." >&2
+            echo "Computed tag ${NEXT} already exists. Exiting to respect immutability." >&2
             exit 1
           fi
           echo "next=${NEXT}" >> "$GITHUB_OUTPUT"
-
-      # NEW: enable cross-arch emulation, then Buildx
-      - name: Set up QEMU (for cross-arch builds)
-        uses: docker/setup-qemu-action@v3
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -77,26 +80,25 @@ jobs:
         id: buildmeta
         run: echo "created=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
 
-      # UPDATED: build/push ARM64 image (to match your ECS task)
-      - name: Build & Push Docker image to ECR (ARM64)
+      - name: Build & Push Docker image to ECR
         id: build-image
         uses: docker/build-push-action@v5
         with:
           context: .
           file: Dockerfile
           push: true
-          platforms: linux/arm64
           tags: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.version.outputs.next }}
           labels: |
             org.opencontainers.image.created=${{ steps.buildmeta.outputs.created }}
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.version=${{ steps.version.outputs.next }}
             org.opencontainers.image.source=${{ github.repository }}
-          cache-from: type=gha,scope=ecr-main-arm64
-          cache-to: type=gha,mode=max,scope=ecr-main-arm64
+          cache-from: type=gha,scope=ecr-main
+          cache-to: type=gha,mode=max,scope=ecr-main
           provenance: false
+      
+      # --- DEPLOYMENT STEPS ---
 
-      # --- DEPLOYMENT STEPS (unchanged) ---
       - name: Validate ECS names (quick sanity)
         run: |
           set -euo pipefail
@@ -107,9 +109,12 @@ jobs:
       - name: Generate task definition from current (sanitize)
         run: |
           set -euo pipefail
+          # Get the latest ACTIVE revision for the family
           aws ecs describe-task-definition \
             --task-definition "${TASK_FAMILY}" \
             --query taskDefinition > td.raw.json
+
+          # Remove read-only fields so it can be re-registered
           jq 'del(
               .taskDefinitionArn,
               .revision,
@@ -119,6 +124,10 @@ jobs:
               .registeredAt,
               .registeredBy
             )' td.raw.json > "${ECS_TASK_DEFINITION}"
+
+          echo "Sanitized task-def saved to: ${ECS_TASK_DEFINITION}"
+          echo "Container names in TD:"
+          jq -r '.containerDefinitions[].name' "${ECS_TASK_DEFINITION}"
 
       - name: Render task definition with new image
         id: task-def
@@ -136,6 +145,8 @@ jobs:
           cluster: ${{ env.ECS_CLUSTER }}
           wait-for-service-stability: true
 
+
+          # --- SLACK NOTIFICATION STEP ---
       - name: Notify Slack (incoming webhook)
         if: ${{ success() }}
         env:
@@ -149,6 +160,7 @@ jobs:
           IMAGE="${ECR_REGISTRY}/${ECR_REPOSITORY}:${TAG}"
           SHORT_SHA="${GITHUB_SHA::7}"
           RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+
           payload=$(jq -n \
             --arg header ":whale: *Docker image pushed to ECR*" \
             --arg image "$IMAGE" \
@@ -166,4 +178,5 @@ jobs:
                 {type:"mrkdwn", text:"*Workflow run:*\n\($run)"}
               ]}
             ]}')
-          curl -X POST -H 'Content-type: application/json' --data "$payload" "$SLACK_WEBHOOK_URL"
+          curl -X POST -H 'Content-type: application/json' \
+               --data "$payload" "$SLACK_WEBHOOK_URL"
