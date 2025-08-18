@@ -2,8 +2,7 @@ name: Build, Push, and Deploy to ECS
 
 on:
   push:
-    branches:
-      - main
+    branches: [ main ]
 
 permissions:
   id-token: write
@@ -14,26 +13,41 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  # --- Configuration Pulled from GitHub Repository Variables ---
-  # This section now references the variables you've set in your
-  # repository's settings (Settings > Secrets and variables > Actions > Variables).
-  AWS_REGION: ${{ vars.AWS_REGION }}
-  ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
-  START_VERSION: ${{ vars.START_VERSION }}
-  ECS_SERVICE: ${{ vars.SERVICE_NAME }}
-  ECS_CLUSTER: ${{ vars.CLUSTER_NAME }}
-  TASK_FAMILY: ${{ vars.TASK_FAMILY }}
-  CONTAINER_NAME: ${{ vars.CONTAINER_NAME }}
-  ECS_TASK_DEFINITION: task-definition.json # Local filename for the task definition
+  AWS_REGION:       ${{ vars.AWS_REGION }}
+  ECR_REPOSITORY:   ${{ vars.ECR_REPOSITORY }}
+  START_VERSION:    ${{ vars.START_VERSION }}
+  ECS_SERVICE:      ${{ vars.SERVICE_NAME }}
+  ECS_CLUSTER:      ${{ vars.CLUSTER_NAME }}
+  TASK_FAMILY:      ${{ vars.TASK_FAMILY }}
+  CONTAINER_NAME:   ${{ vars.CONTAINER_NAME }}
+  ECS_TASK_DEFINITION: task-definition.json
 
 jobs:
-  build-push-and-deploy:
+  # ────────────────────────────────────────────
+  # Stage 1: Checkout (separate box)
+  # ────────────────────────────────────────────
+  prepare:
+    name: checkout
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Configure AWS credentials using OIDC
+  # ────────────────────────────────────────────
+  # Stage 2: Build & Push (login → build → push)
+  # ────────────────────────────────────────────
+  build-and-push:
+    name: build-and-push
+    runs-on: ubuntu-latest
+    needs: [prepare]
+    outputs:
+      image:    ${{ steps.out.outputs.image }}
+      tag:      ${{ steps.version.outputs.next }}
+      registry: ${{ steps.login-ecr.outputs.registry }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_OIDC_ROLE }}
@@ -43,9 +57,9 @@ jobs:
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Install jq (for version parsing)
+      - name: Install jq
         run: |
-          sudo apt-get update
+          sudo apt-get update -y
           sudo apt-get install -y jq
 
       - name: Compute next version from ECR (patch bump)
@@ -54,21 +68,17 @@ jobs:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
         shell: bash
         run: |
-          # This script correctly computes the next patch version.
-          # No changes were needed here.
           set -euo pipefail
           TAGS_JSON="$(aws ecr describe-images --repository-name "${ECR_REPOSITORY}" --query 'imageDetails[].imageTags' --output json 2>/dev/null || echo '[]')"
           HIGHEST="$(echo "${TAGS_JSON}" | jq -r '[ .[]? | .[]? | select(test("^[0-9]+\\.[0-9]+\\.[0-9]+$")) ] | sort_by( split(".") | map(tonumber) ) | last // empty')"
           if [[ -z "${HIGHEST}" ]]; then
             NEXT="${START_VERSION}"
-            echo "No numeric tags found, starting at ${NEXT}"
           else
             IFS='.' read -r MA MI PA <<< "${HIGHEST}"
             NEXT="${MA}.${MI}.$((PA+1))"
-            echo "Highest existing tag: ${HIGHEST} -> next: ${NEXT}"
           fi
           if aws ecr list-images --repository-name "${ECR_REPOSITORY}" --filter tagStatus=TAGGED --query 'imageIds[].imageTag' --output text | grep -qx "${NEXT}"; then
-            echo "Computed tag ${NEXT} already exists. Exiting to respect immutability." >&2
+            echo "Computed tag ${NEXT} already exists." >&2
             exit 1
           fi
           echo "next=${NEXT}" >> "$GITHUB_OUTPUT"
@@ -87,6 +97,7 @@ jobs:
           context: .
           file: Dockerfile
           push: true
+          # (leave platforms unset to use the runner arch you’ve already aligned to)
           tags: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.version.outputs.next }}
           labels: |
             org.opencontainers.image.created=${{ steps.buildmeta.outputs.created }}
@@ -94,10 +105,63 @@ jobs:
             org.opencontainers.image.version=${{ steps.version.outputs.next }}
             org.opencontainers.image.source=${{ github.repository }}
           cache-from: type=gha,scope=ecr-main
-          cache-to: type=gha,mode=max,scope=ecr-main
+          cache-to:   type=gha,mode=max,scope=ecr-main
           provenance: false
-      
-      # --- DEPLOYMENT STEPS ---
+
+      - name: Expose image output
+        id: out
+        run: |
+          echo "image=${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.version.outputs.next }}" >> "$GITHUB_OUTPUT"
+
+  # ────────────────────────────────────────────
+  # Stage 3: Notify (image built)
+  # ────────────────────────────────────────────
+  notify-build:
+    name: notify-image-built
+    runs-on: ubuntu-latest
+    needs: [build-and-push]
+    if: ${{ success() }}
+    steps:
+      - name: Notify Slack (image built)
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          IMAGE:   ${{ needs.build-and-push.outputs.image }}
+          REG:     ${{ needs.build-and-push.outputs.registry }}
+          REPO:    ${{ env.ECR_REPOSITORY }}
+          TAG:     ${{ needs.build-and-push.outputs.tag }}
+        run: |
+          sudo apt-get update -y >/dev/null && sudo apt-get install -y jq >/dev/null
+          payload=$(jq -n \
+            --arg header ":whale: *Docker image built & pushed*" \
+            --arg image "$IMAGE" \
+            '{text:$header, blocks:[
+              {type:"section", text:{type:"mrkdwn", text:$header}},
+              {type:"section", fields:[
+                {type:"mrkdwn", text:"*Image:*\n\($image)"}
+              ]}
+            ]}')
+          curl -X POST -H 'Content-type: application/json' --data "$payload" "$SLACK_WEBHOOK_URL"
+
+  # ────────────────────────────────────────────
+  # Stage 4: Deploy to ECS
+  # ────────────────────────────────────────────
+  deploy-ecs:
+    name: deploy-ecs
+    runs-on: ubuntu-latest
+    needs: [build-and-push]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_OIDC_ROLE }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Install jq
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y jq
 
       - name: Validate ECS names (quick sanity)
         run: |
@@ -106,15 +170,12 @@ jobs:
           aws ecs describe-clusters --clusters "$ECS_CLUSTER" --query 'clusters[].status'
           aws ecs describe-services --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" --query 'services[].status'
 
-      - name: Generate task definition from current (sanitize)
+      - name: Download & sanitize task definition
         run: |
           set -euo pipefail
-          # Get the latest ACTIVE revision for the family
           aws ecs describe-task-definition \
             --task-definition "${TASK_FAMILY}" \
             --query taskDefinition > td.raw.json
-
-          # Remove read-only fields so it can be re-registered
           jq 'del(
               .taskDefinitionArn,
               .revision,
@@ -125,19 +186,15 @@ jobs:
               .registeredBy
             )' td.raw.json > "${ECS_TASK_DEFINITION}"
 
-          echo "Sanitized task-def saved to: ${ECS_TASK_DEFINITION}"
-          echo "Container names in TD:"
-          jq -r '.containerDefinitions[].name' "${ECS_TASK_DEFINITION}"
-
       - name: Render task definition with new image
         id: task-def
         uses: aws-actions/amazon-ecs-render-task-definition@v1
         with:
           task-definition: ${{ env.ECS_TASK_DEFINITION }}
           container-name: ${{ env.CONTAINER_NAME }}
-          image: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.version.outputs.next }}
+          image: ${{ needs.build-and-push.outputs.image }}
 
-      - name: Deploy Amazon ECS task definition
+      - name: Deploy to ECS
         uses: aws-actions/amazon-ecs-deploy-task-definition@v1
         with:
           task-definition: ${{ steps.task-def.outputs.task-definition }}
@@ -145,38 +202,35 @@ jobs:
           cluster: ${{ env.ECS_CLUSTER }}
           wait-for-service-stability: true
 
-
-          # --- SLACK NOTIFICATION STEP ---
-      - name: Notify Slack (incoming webhook)
-        if: ${{ success() }}
+  # ────────────────────────────────────────────
+  # Stage 5: Notify (deployed)
+  # ────────────────────────────────────────────
+  notify-deploy:
+    name: notify-deployed
+    runs-on: ubuntu-latest
+    needs: [deploy-ecs, build-and-push]
+    if: ${{ success() }}
+    steps:
+      - name: Notify Slack (deployed to ECS)
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-          ECR_REPOSITORY: ${{ env.ECR_REPOSITORY }}
-          TAG: ${{ steps.version.outputs.next }}
-        run: |
-          set -euo pipefail
-          sudo apt-get update >/dev/null && sudo apt-get install -y jq >/dev/null
-          IMAGE="${ECR_REGISTRY}/${ECR_REPOSITORY}:${TAG}"
-          SHORT_SHA="${GITHUB_SHA::7}"
-          RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          IMAGE: ${{ needs.build-and-push.outputs.image }}
+          RUN_URL: "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          SHORT_SHA: "${{ github.sha }}"
 
+        run: |
+          sudo apt-get update -y >/dev/null && sudo apt-get install -y jq >/dev/null
           payload=$(jq -n \
-            --arg header ":whale: *Docker image pushed to ECR*" \
+            --arg header ":rocket: *Deployed to ECS successfully*" \
             --arg image "$IMAGE" \
-            --arg tag "$TAG" \
-            --arg repo "$GITHUB_REPOSITORY" \
-            --arg sha "$SHORT_SHA" \
             --arg run "$RUN_URL" \
+            --arg sha "${SHORT_SHA::7}" \
             '{text:$header, blocks:[
               {type:"section", text:{type:"mrkdwn", text:$header}},
               {type:"section", fields:[
                 {type:"mrkdwn", text:"*Image:*\n\($image)"},
-                {type:"mrkdwn", text:"*Tag:*\n\($tag)"},
-                {type:"mrkdwn", text:"*Repo:*\n\($repo)"},
-                {type:"mrkdwn", text:"*Commit:*\n\($sha)"},
-                {type:"mrkdwn", text:"*Workflow run:*\n\($run)"}
+                {type:"mrkdwn", text:"*Workflow run:*\n\($run)"},
+                {type:"mrkdwn", text:"*Commit:*\n\($sha)"}
               ]}
             ]}')
-          curl -X POST -H 'Content-type: application/json' \
-               --data "$payload" "$SLACK_WEBHOOK_URL"
+          curl -X POST -H 'Content-type: application/json' --data "$payload" "$SLACK_WEBHOOK_URL"
